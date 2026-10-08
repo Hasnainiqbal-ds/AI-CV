@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -20,6 +21,9 @@ from pypdf import PdfReader
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 MODEL_CHOICES = [DEFAULT_MODEL, "gemini-3.6-flash", "gemini-3.5-flash"]
 MODEL_CHOICES = list(dict.fromkeys(MODEL_CHOICES))  # remove duplicates, keep order
+
+RETRIES_PER_MODEL = 3  # attempts per model before trying the next one
+BACKOFF_SECONDS = 2  # wait 2s, then 4s, between attempts
 
 MAX_FILE_MB = 5
 MAX_CHARS = 20000  # resume text sent to the model
@@ -190,17 +194,61 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+def _error_code(exc: Exception):
+    """Best-effort HTTP status code from an API error."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    match = re.search(r"\b(4\d\d|5\d\d)\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def is_transient(exc: Exception) -> bool:
+    """Temporary server problems: overload (503), rate limit (429), timeouts."""
+    text = str(exc).upper()
+    return _error_code(exc) in (429, 500, 502, 503, 504) or any(
+        w in text for w in ("UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "RESOURCE_EXHAUSTED", "TIMED OUT")
     )
-    return normalize_result(parse_json(response.text))
+
+
+def is_model_missing(exc: Exception) -> bool:
+    return _error_code(exc) == 404 or "NOT FOUND" in str(exc).upper()
+
+
+def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+    """Call Gemini with retries; fall back to other Flash models if one is busy."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description)
+    config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+
+    models_to_try = [model] + [m for m in MODEL_CHOICES if m != model]
+    last_error = None
+
+    for current in models_to_try:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=current, contents=prompt, config=config)
+                result = normalize_result(parse_json(response.text))
+                result["model_used"] = current
+                return result
+            except Exception as exc:
+                last_error = exc
+                if is_model_missing(exc):
+                    break  # this model name is not valid, try the next one
+                if not is_transient(exc):
+                    raise  # bad API key, bad request, invalid JSON, etc.
+                if attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(BACKOFF_SECONDS * (2 ** attempt))
+                # otherwise loop ends and we move on to the next model
+
+    if last_error is not None and not is_transient(last_error):
+        raise last_error
+    raise RuntimeError(
+        "Gemini is overloaded right now (tried "
+        + ", ".join(models_to_try)
+        + "). Please wait a minute and try again. Last error: "
+        + str(last_error)
+    )
 
 
 # --------------------------------- UI ------------------------------------- #
@@ -226,6 +274,8 @@ def score_label(score: int) -> str:
 
 def render_results(result: dict) -> None:
     st.subheader("Your ATS Score")
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
     left, right = st.columns([1, 2])
     with left:
         st.metric("Overall ATS score", f"{result['overall']} / 100")
