@@ -68,6 +68,7 @@ Create the empty repository on github.com first (no README/.gitignore added ther
 ## Troubleshooting
 | Problem | Fix |
 |---|---|
+| "503 UNAVAILABLE / high demand" | Google's servers are busy. The app retries and switches models automatically; if it still fails, wait a minute and retry |
 | "Analysis failed ... model not found" | Pick another model in the sidebar or set `GEMINI_MODEL` |
 | "Analysis failed ... API key" | Check the key; make sure it has no extra spaces |
 | "Very little text was found" | Resume is likely a scanned image; use a text-based file |
